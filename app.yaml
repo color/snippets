@@ -15,9 +15,11 @@ handlers:
 - url: /admin/.*
   script: snippets.application
   login: admin
+  secure: always
 
 - url: .*
   script: snippets.application
+  secure: always
 
 skip_files:
 - .git

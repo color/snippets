@@ -185,30 +185,44 @@ def _user_snippet(user_email, weeks_back=0):
 
 
 def _snippet_items(snippet):
-    """Return all markdown items in the snippet text.
+    """Return a list of markdown items in the snippet text and any before/after residual.
 
-    For this we expect it the snippet to contain *nothing* but a markdown list.
-    We do not support "indented" list style, only one item per linebreak.
+    We find the first run of consecutive lines beginning with -*+, and extract those as items.
 
-    Raises SyntaxError if snippet not in proper format (e.g. contains
-        anything other than a markdown list).
+    Any text before the run begins, or text after the run ends, are preserved. This allows
+    users to share additional content in their snippets besides a single ordered list. Slack
+    won't allow edits to this prefix/suffix, but it won't lose or otherwise disturb it.
+
+    Returns a 3-tuple: prefix, items, suffix. prefix/suffix may be empty, as may items.
     """
     unformatted = snippet.text and snippet.text.strip()
 
     # treat null text value as empty list
     if not unformatted:
-        return []
+        return '', [], ''
 
-    # parse out all markdown list items
-    items = re.findall(r'^[-*+] +(.*)$', unformatted, re.MULTILINE)
+    prefix_lines = []
+    items = []
+    suffix_lines = []
+    for line in unformatted.split('\n'):
+        if suffix_lines:
+            # We've already found and passed a consecutive run of list items
+            suffix_lines.append(line)
+            continue
 
-    # if there were any lines that didn't yield an item, assume there was
-    # something we didn't parse. since we never want to lose existing data
-    # for a user, this is an error condition.
-    if len(items) < len(unformatted.splitlines()):
-        raise SyntaxError('unparsed lines in user snippet: %s' % unformatted)
+        # A valid "item" is a line beginning with a markdown list item and a space
+        is_item = len(line) > 2 and line[0] in '-*+' and line[1] == ' '
+        if is_item:
+            items.append(line[2:])
+        else:
+            if items:
+                # This is the first line after our consecutive run of list items. Begin the suffix.
+                suffix_lines = [line]
+            else:
+                # Haven't encountered a run of list items yet: just another random prefix line.
+                prefix_lines.append(line)
 
-    return items
+    return '\n'.join(prefix_lines), items, '\n'.join(suffix_lines)
 
 
 def _format_snippet_items(items):
@@ -220,25 +234,23 @@ def _format_snippet_items(items):
 def command_list(user_email):
     """Return the users current snippets for the week in pretty format."""
     try:
-        items = _snippet_items(_user_snippet(user_email))
+        snippet = _user_snippet(user_email)
+        prefix, items, suffix = _snippet_items(snippet)
     except ValueError:
         return _no_user_error(user_email)
-    except SyntaxError:
-        return (
-            "*Your snippets are not in a format I understand.* :cry:\n"
-            "I support markdown lists only, "
-            "for more information see `/snippets help` ."
-        )
+
+    if not snippet.text:
+        return "*No snippet yet this week*. Try `/snippets add` to record an item. :rocket:"
 
     if not items:
         return (
-            "*You don't have any snippets for this week yet!* :speak_no_evil:\n"
-            ":pencil: Use `/snippets add` to create one, or try "
-            "`/snippets help` ."
+            "*We found your snippet, but it doesn't have any listed items yet!* :speak_no_evil:\n"
+            ":pencil: Use `/snippets add` to add an item. Here's what we have for you:\n"
+            "```{}```".format(snippet.text)
         )
 
     return textwrap.dedent(
-        "*Your snippets for the week so far:*\n" +
+        "*Your snippet items for the week so far:*\n" +
         _format_snippet_items(items)
     )
 
@@ -246,26 +258,17 @@ def command_list(user_email):
 def command_last(user_email):
     """Return the users snippets for last week in a pretty format."""
     try:
-        items = _snippet_items(_user_snippet(user_email, 1))
+        snippet = _user_snippet(user_email, 1)
+        prefix, items, suffix = _snippet_items(snippet)
     except ValueError:
         return _no_user_error(user_email)
     except IndexError:
         return "*You didn't have any snippets last week!* :speak_no_evil:"
-    except SyntaxError:
-        return (
-            "*Your snippets last week are not in a format I understand.* "
-            ":cry:\n"
-            "I support markdown lists only. "
-            "For more information see `/snippets help` ."
-        )
 
-    if not items:
+    if not snippet.text:
         return "*You didn't have any snippets last week!* :speak_no_evil:"
 
-    return textwrap.dedent(
-        "*Your snippets for last week:*\n" +
-        _format_snippet_items(items)
-    )
+    return "```{}```".format(snippet.text)
 
 
 def _linkify_usernames(text):
@@ -289,19 +292,13 @@ def command_add(user_email, new_item):
     # TODO(csilvers): move this get/update/put atomic into a txn
     try:
         snippet = _user_snippet(user_email)      # may raise ValueError
-        items = _snippet_items(snippet)          # may raise SyntaxError
+        prefix, items, suffix = _snippet_items(snippet)
     except ValueError:
         return _no_user_error(user_email)
-    except SyntaxError:
-        return (
-            "*Your snippets are not in a format I understand.* :cry:\n"
-            "So I can't add to them! FYI I support markdown lists only, "
-            "for more information see `/snippets help` ."
-        )
 
     new_item = _linkify_usernames(new_item)
     items.append(new_item)
-    snippet.text = _markdown_list(items)
+    snippet.text = prefix + "\n" + _markdown_list(items) + "\n" + suffix
     snippet.is_markdown = True
 
     # TODO(mroth): we should abstract out DB writes to a library wrapper
@@ -332,15 +329,9 @@ def command_del(user_email, args):
     # TODO(csilvers): move this get/update/put atomic into a txn
     try:
         snippet = _user_snippet(user_email)      # may raise ValueError
-        items = _snippet_items(snippet)          # may raise SyntaxError
+        prefix, items, suffix = _snippet_items(snippet)
     except ValueError:
         return _no_user_error(user_email)
-    except SyntaxError:
-        return (
-            "*Your snippets are not in a format I understand.* :cry:\n"
-            "So I can't delete from them! FYI I support markdown lists only, "
-            "for more information see `/snippets help` ."
-        )
 
     try:
         removed_item = items[index]
@@ -351,7 +342,7 @@ def command_del(user_email, args):
             _format_snippet_items(items)
         )
 
-    snippet.text = _markdown_list(items)
+    snippet.text = prefix + "\n" + _markdown_list(items) + "\n" + suffix
     snippet.is_markdown = True
 
     db.put(snippet)
